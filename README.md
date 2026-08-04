@@ -30,7 +30,7 @@ Grok 多账号反向代理。CPA 轮询 + RT 自动续命 + SSO 复活死号。
 | `revive_enabled` | 是否用 SSO 复活死 RT（有 `sso_file` 时默认开） |
 | `revive_interval` | 限流重试扫描间隔（秒），默认 600 |
 | `revive_concurrency` | 同时 SSO OAuth 数，默认 2（防 429；2000 号务必小） |
-| `proxy` | 可选出站 HTTP 代理（清障 `http://host:40080`） |
+| `proxy` | 可选出站代理。支持 `http://`、`https://`、`socks5://`、`socks5h://`（含 `user:pass` 认证），如 `socks5://127.0.0.1:1080` |
 
 ## 选号策略（粘性）
 
@@ -79,7 +79,7 @@ docker compose up -d
 curl -s localhost:5001/healthz
 ```
 
-镜像：`ghcr.io/myflavor/grok-proxy:v0.3.0` / `latest`
+镜像：`ghcr.io/myflv/grok-proxy:v0.4.0` / `latest`
 
 ## 调用
 

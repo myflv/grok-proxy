@@ -54,13 +54,9 @@ type SSOOAuth struct {
 }
 
 func NewSSOOAuth(proxy string) (*SSOOAuth, error) {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	if proxy != "" {
-		u, err := url.Parse(proxy)
-		if err != nil {
-			return nil, err
-		}
-		tr.Proxy = http.ProxyURL(u)
+	tr, err := buildTransport(proxy)
+	if err != nil {
+		return nil, err
 	}
 	return &SSOOAuth{
 		client: &http.Client{

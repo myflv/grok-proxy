@@ -1,7 +1,7 @@
 # Build stage
 FROM golang:1.26-alpine AS builder
 WORKDIR /build
-COPY go.mod ./
+COPY go.mod go.sum ./
 COPY *.go ./
 RUN go build -ldflags="-s -w" -o grok-proxy
 

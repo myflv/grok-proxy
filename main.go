@@ -47,7 +47,7 @@ type Config struct {
 	ReviveEnabled     *bool  `json:"revive_enabled"`     // default true if sso_file set
 	ReviveInterval    int    `json:"revive_interval"`    // seconds, default 600
 	ReviveConcurrency int    `json:"revive_concurrency"` // default 2
-	Proxy             string `json:"proxy"`              // optional HTTP proxy for OAuth/refresh
+	Proxy             string `json:"proxy"`              // optional outbound proxy: http(s):// or socks5(h):// for OAuth/refresh/upstream
 }
 
 // ---------- account ----------
@@ -713,14 +713,9 @@ type Server struct {
 }
 
 func NewServer(cfg Config) (*Server, error) {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if cfg.Proxy != "" {
-		u, err := url.Parse(cfg.Proxy)
-		if err != nil {
-			return nil, fmt.Errorf("proxy: %w", err)
-		}
-		transport.Proxy = http.ProxyURL(u)
-		log.Printf("[proxy] outbound via %s", cfg.Proxy)
+	transport, err := buildTransport(cfg.Proxy)
+	if err != nil {
+		return nil, err
 	}
 	client := &http.Client{Timeout: 60 * time.Second, Transport: transport}
 	pool, err := NewPool(cfg.CPADir, client)
