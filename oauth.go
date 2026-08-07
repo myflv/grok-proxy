@@ -469,6 +469,29 @@ func jwtHasClaim(token, key string) bool {
 	return ok
 }
 
+// jwtExp returns the JWT "exp" claim as a time.Time (UTC). ok=false if missing/invalid.
+func jwtExp(token string) (time.Time, bool) {
+	m := jwtPayload(token)
+	if m == nil {
+		return time.Time{}, false
+	}
+	switch v := m["exp"].(type) {
+	case float64:
+		if v <= 0 {
+			return time.Time{}, false
+		}
+		return time.Unix(int64(v), 0).UTC(), true
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil || n <= 0 {
+			return time.Time{}, false
+		}
+		return time.Unix(n, 0).UTC(), true
+	default:
+		return time.Time{}, false
+	}
+}
+
 func locationError(loc string) error {
 	if loc == "" {
 		return nil

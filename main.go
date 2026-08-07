@@ -295,9 +295,23 @@ func (p *Pool) load() error {
 		acct.filePath = path
 		acct.dead = false
 		acct.hasBFS = jwtHasClaim(acct.AccessToken, "bfs")
-		if acct.Expired != "" {
+		// Prefer JWT exp (source of truth). Fall back to CPA "expired" field.
+		// Never default to time.Now() when AT is still valid — that forced a
+		// full-pool refresh on every process restart.
+		if exp, ok := jwtExp(acct.AccessToken); ok {
+			acct.expiresAt = exp
+			if acct.Expired == "" {
+				acct.Expired = exp.Format(time.RFC3339)
+			}
+		} else if acct.Expired != "" {
 			if t, err := time.Parse(time.RFC3339, acct.Expired); err == nil {
 				acct.expiresAt = t
+			} else {
+				acct.expiresAt = time.Now()
+			}
+		} else if acct.ExpiresIn > 0 && acct.LastRefresh != "" {
+			if lr, err := time.Parse(time.RFC3339, acct.LastRefresh); err == nil {
+				acct.expiresAt = lr.Add(time.Duration(acct.ExpiresIn) * time.Second)
 			} else {
 				acct.expiresAt = time.Now()
 			}

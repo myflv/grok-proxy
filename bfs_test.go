@@ -3,7 +3,10 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func makeJWT(claims map[string]any) string {
@@ -96,5 +99,85 @@ func TestSelectAccountNeverReturnsBFS(t *testing.T) {
 		if a := only.selectAccount(""); a != nil {
 			t.Fatalf("expected nil, got %s bfs=%v", a.Email, a.hasBFS)
 		}
+	}
+}
+
+func TestJwtExp(t *testing.T) {
+	exp := time.Now().UTC().Add(3 * time.Hour).Unix()
+	tok := makeJWT(map[string]any{"sub": "u", "exp": float64(exp)})
+	got, ok := jwtExp(tok)
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	if got.Unix() != exp {
+		t.Fatalf("exp=%d got=%d", exp, got.Unix())
+	}
+	if _, ok := jwtExp(makeJWT(map[string]any{"sub": "u"})); ok {
+		t.Fatal("missing exp should be false")
+	}
+	if _, ok := jwtExp("bad"); ok {
+		t.Fatal("garbage should be false")
+	}
+}
+
+func TestLoadUsesJWTExpNotNow(t *testing.T) {
+	dir := t.TempDir()
+	exp := time.Now().UTC().Add(4 * time.Hour).Truncate(time.Second)
+	tok := makeJWT(map[string]any{
+		"sub": "u1",
+		"exp": float64(exp.Unix()),
+	})
+	// intentionally omit "expired" field — old code would set expiresAt=now and refresh
+	body := map[string]any{
+		"access_token":  tok,
+		"refresh_token": "rt-test",
+		"email":         "jwt-exp@x.ai",
+	}
+	raw, _ := json.MarshalIndent(body, "", "  ")
+	path := filepath.Join(dir, "a.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := NewPool(filepath.Join(dir, "*.json"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pool.accounts) != 1 {
+		t.Fatalf("want 1 account, got %d", len(pool.accounts))
+	}
+	a := pool.accounts[0]
+	if a.needsRefresh() {
+		t.Fatalf("fresh JWT should not need refresh; expiresAt=%s now=%s",
+			a.expiresAt, time.Now())
+	}
+	if d := a.expiresAt.Sub(exp).Abs(); d > time.Second {
+		t.Fatalf("expiresAt=%s want ~%s (delta %s)", a.expiresAt, exp, d)
+	}
+}
+
+func TestLoadFallsBackToExpiredField(t *testing.T) {
+	dir := t.TempDir()
+	exp := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Second)
+	// non-JWT access token → fall back to expired field
+	body := map[string]any{
+		"access_token":  "not-a-jwt",
+		"refresh_token": "rt-test",
+		"email":         "fallback@x.ai",
+		"expired":       exp.Format(time.RFC3339),
+	}
+	raw, _ := json.MarshalIndent(body, "", "  ")
+	if err := os.WriteFile(filepath.Join(dir, "b.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := NewPool(filepath.Join(dir, "*.json"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := pool.accounts[0]
+	if a.needsRefresh() {
+		t.Fatal("should not need refresh")
+	}
+	if d := a.expiresAt.Sub(exp).Abs(); d > time.Second {
+		t.Fatalf("expiresAt=%s want %s", a.expiresAt, exp)
 	}
 }
