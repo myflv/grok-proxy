@@ -64,11 +64,11 @@ func TestSelectAccountSkipsBFS(t *testing.T) {
 func TestApplyTokensUpdatesBFS(t *testing.T) {
 	a := &Account{}
 	a.applyTokens(makeJWT(map[string]any{"bfs": 2}), "rt", 3600)
-	if !a.hasBFSClaim() {
+	if !a.hasBFS {
 		t.Fatal("expected hasBFS after apply")
 	}
 	a.applyTokens(makeJWT(map[string]any{"sub": "u"}), "rt", 3600)
-	if a.hasBFSClaim() {
+	if a.hasBFS {
 		t.Fatal("expected hasBFS cleared after re-apply without claim")
 	}
 }

@@ -100,12 +100,6 @@ func (a *Account) isDead() bool {
 	return a.dead
 }
 
-func (a *Account) hasBFSClaim() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.hasBFS
-}
-
 // usableForRequest: not dead, not bfs-filtered (cooldown checked separately).
 func (a *Account) usableForRequest() bool {
 	a.mu.Lock()
@@ -119,15 +113,10 @@ func (a *Account) inCooldown() bool {
 	return time.Now().Before(a.cooldownUntil)
 }
 
-// needsRefresh: true when remaining TTL <= lead.
-// lead comes from the refresh timer (2×refresh_interval) so a single
-// interval scanner is enough — no separate fixed skew.
+// needsRefresh: true when remaining TTL <= lead (caller supplies pool.refreshLead).
 func (a *Account) needsRefresh(lead time.Duration) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if lead <= 0 {
-		lead = 10 * time.Minute
-	}
 	return !time.Now().Before(a.expiresAt.Add(-lead))
 }
 
@@ -249,11 +238,11 @@ type Pool struct {
 	refreshLead time.Duration
 }
 
-// NewPool loads CPA files. refreshLead is how far ahead of exp we refresh;
-// typically 2×refresh_interval so one interval scan cannot miss expiry.
+// NewPool loads CPA files. refreshLead must already be resolved by the caller
+// (NewServer: refresh_lead or 2×refresh_interval).
 func NewPool(glob string, client *http.Client, refreshLead time.Duration) (*Pool, error) {
 	if refreshLead <= 0 {
-		refreshLead = 10 * time.Minute
+		refreshLead = 10 * time.Minute // defensive only; production path always sets lead
 	}
 	p := &Pool{glob: glob, client: client, refreshLead: refreshLead}
 	if err := p.load(); err != nil {
@@ -309,11 +298,10 @@ func (p *Pool) load() error {
 
 		acct.filePath = path
 		acct.dead = false
-		acct.hasBFS = jwtHasClaim(acct.AccessToken, "bfs")
-		// Prefer JWT exp (source of truth). Fall back to CPA "expired" field.
-		// Never default to time.Now() when AT is still valid — that forced a
-		// full-pool refresh on every process restart.
-		if exp, ok := jwtExp(acct.AccessToken); ok {
+		// One JWT decode for bfs + exp (source of truth for expiry).
+		hasBFS, exp, expOK := jwtInspectAccess(acct.AccessToken)
+		acct.hasBFS = hasBFS
+		if expOK {
 			acct.expiresAt = exp
 			if acct.Expired == "" {
 				acct.Expired = exp.Format(time.RFC3339)
@@ -333,51 +321,32 @@ func (p *Pool) load() error {
 		} else {
 			acct.expiresAt = time.Now()
 		}
-		if acct.Headers == nil || len(acct.Headers) == 0 {
+		if len(acct.Headers) == 0 {
 			acct.Headers = defaultCPAHeaders()
 		}
 
 		list = append(list, &acct)
-		if acct.hasBFS {
-			log.Printf("[load] %s (expires %s) bfs=yes — refresh only, skip serve",
-				acct.Email, acct.expiresAt.Format(time.RFC3339))
-		} else {
-			log.Printf("[load] %s (expires %s)", acct.Email, acct.expiresAt.Format(time.RFC3339))
-		}
 	}
 
 	if len(list) == 0 {
 		return fmt.Errorf("no valid CPA JSON in %s", p.glob)
 	}
 
-	bfsN := 0
+	bfsN, needRef := 0, 0
 	for _, a := range list {
 		if a.hasBFS {
 			bfsN++
+		}
+		if !a.dead && a.needsRefresh(p.refreshLead) {
+			needRef++
 		}
 	}
 	p.mu.Lock()
 	p.accounts = list
 	p.mu.Unlock()
-	needRef := 0
-	for _, a := range list {
-		if !a.dead && a.needsRefresh(p.refreshLead) {
-			needRef++
-		}
-	}
 	log.Printf("[pool] loaded %d accounts (skipped %d .dead, %d bfs-filtered, %d due-refresh lead=%s)",
 		len(list), skippedDead, bfsN, needRef, p.refreshLead)
 	return nil
-}
-
-func countLive(list []*Account) int {
-	n := 0
-	for _, a := range list {
-		if !a.dead && !a.hasBFS {
-			n++
-		}
-	}
-	return n
 }
 
 func (p *Pool) findByEmail(email string) *Account {
@@ -426,9 +395,11 @@ func (p *Pool) bfsCount() int {
 	defer p.mu.RUnlock()
 	n := 0
 	for _, a := range p.accounts {
-		if a.hasBFSClaim() {
+		a.mu.Lock()
+		if a.hasBFS && !a.dead {
 			n++
 		}
+		a.mu.Unlock()
 	}
 	return n
 }
@@ -546,11 +517,11 @@ func (p *Pool) refreshAll(ctx context.Context) {
 				exp := acct.expiresAt
 				bfs := acct.hasBFS
 				acct.mu.Unlock()
+				suffix := ""
 				if bfs {
-					log.Printf("[refresh] %s ok (expires %s, bfs)", acct.Email, exp.UTC().Format(time.RFC3339))
-				} else {
-					log.Printf("[refresh] %s ok (expires %s)", acct.Email, exp.UTC().Format(time.RFC3339))
+					suffix = ", bfs"
 				}
+				log.Printf("[refresh] %s ok (expires %s%s)", acct.Email, exp.UTC().Format(time.RFC3339), suffix)
 			}
 		}(a)
 	}
@@ -562,12 +533,11 @@ func (p *Pool) refresh(ctx context.Context, a *Account) error {
 	a.refreshMu.Lock()
 	defer a.refreshMu.Unlock()
 
-	// Skip if another goroutine already refreshed past the lead window
-	// (same threshold as needsRefresh — one rule only).
+	// Same rule as needsRefresh: if no longer due, another worker already renewed.
 	a.mu.Lock()
-	alreadyFresh := a.AccessToken != "" && time.Now().Before(a.expiresAt.Add(-p.refreshLead))
+	hasAT := a.AccessToken != ""
 	a.mu.Unlock()
-	if alreadyFresh {
+	if hasAT && !a.needsRefresh(p.refreshLead) {
 		return errRefreshSkipped
 	}
 
@@ -699,9 +669,8 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 				}), nil
 			}
 
-			var dead bool
-			token, email, headers, dead = acct.snapshot()
-			if dead || acct.hasBFSClaim() {
+			token, email, headers, _ = acct.snapshot()
+			if !acct.usableForRequest() {
 				// race / post-refresh flip — drop without burning attempt
 				acct = nil
 				continue
@@ -720,9 +689,9 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 					// burn this attempt: we engaged the account and moved on
 					break
 				}
-				token, email, headers, dead = acct.snapshot()
-				if dead || acct.hasBFSClaim() {
-					// refreshed into bfs — skip free, do not burn attempt
+				token, email, headers, _ = acct.snapshot()
+				if !acct.usableForRequest() {
+					// refreshed into bfs — skip free
 					t.pool.advanceFrom(email)
 					acct = nil
 					continue
@@ -952,8 +921,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // refreshLoop is the only proactive refresh scheduler.
-// Every refresh_interval seconds it scans the whole pool and refreshes
-// accounts whose remaining TTL <= 2×interval (see Pool.refreshLead).
+// Every refresh_interval seconds it scans the pool and refreshes accounts
+// whose remaining TTL <= refreshLead (config refresh_lead, default 2×interval).
 // On-demand refresh still exists for 401 / empty AT during requests.
 func (s *Server) refreshLoop(ctx context.Context) {
 	interval := s.cfg.RefreshInterval

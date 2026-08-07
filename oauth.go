@@ -459,7 +459,6 @@ func jwtClaim(token, key string) string {
 }
 
 // jwtHasClaim reports whether key exists in the JWT payload (any JSON type).
-// Used to detect xAI access_token "bfs" claim without caring about its value.
 func jwtHasClaim(token, key string) bool {
 	m := jwtPayload(token)
 	if m == nil {
@@ -469,9 +468,12 @@ func jwtHasClaim(token, key string) bool {
 	return ok
 }
 
-// jwtExp returns the JWT "exp" claim as a time.Time (UTC). ok=false if missing/invalid.
+// jwtExp returns the JWT "exp" claim as UTC time. ok=false if missing/invalid.
 func jwtExp(token string) (time.Time, bool) {
-	m := jwtPayload(token)
+	return jwtExpFromPayload(jwtPayload(token))
+}
+
+func jwtExpFromPayload(m map[string]any) (time.Time, bool) {
 	if m == nil {
 		return time.Time{}, false
 	}
@@ -490,6 +492,17 @@ func jwtExp(token string) (time.Time, bool) {
 	default:
 		return time.Time{}, false
 	}
+}
+
+// jwtInspectAccess decodes an access_token once for load/refresh bookkeeping.
+func jwtInspectAccess(token string) (hasBFS bool, exp time.Time, expOK bool) {
+	m := jwtPayload(token)
+	if m == nil {
+		return false, time.Time{}, false
+	}
+	_, hasBFS = m["bfs"]
+	exp, expOK = jwtExpFromPayload(m)
+	return hasBFS, exp, expOK
 }
 
 func locationError(loc string) error {
