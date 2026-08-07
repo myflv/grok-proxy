@@ -139,7 +139,7 @@ func TestLoadUsesJWTExpNotNow(t *testing.T) {
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	pool, err := NewPool(filepath.Join(dir, "*.json"), nil)
+	pool, err := NewPool(filepath.Join(dir, "*.json"), nil, 10*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestLoadUsesJWTExpNotNow(t *testing.T) {
 		t.Fatalf("want 1 account, got %d", len(pool.accounts))
 	}
 	a := pool.accounts[0]
-	if a.needsRefresh() {
+	if a.needsRefresh(10 * time.Minute) {
 		t.Fatalf("fresh JWT should not need refresh; expiresAt=%s now=%s",
 			a.expiresAt, time.Now())
 	}
@@ -170,12 +170,12 @@ func TestLoadFallsBackToExpiredField(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "b.json"), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	pool, err := NewPool(filepath.Join(dir, "*.json"), nil)
+	pool, err := NewPool(filepath.Join(dir, "*.json"), nil, 10*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	a := pool.accounts[0]
-	if a.needsRefresh() {
+	if a.needsRefresh(10 * time.Minute) {
 		t.Fatal("should not need refresh")
 	}
 	if d := a.expiresAt.Sub(exp).Abs(); d > time.Second {
@@ -183,20 +183,21 @@ func TestLoadFallsBackToExpiredField(t *testing.T) {
 	}
 }
 
-func TestNeedsRefreshSkew(t *testing.T) {
-	// Accounts more than refreshSkew from expiry must not need refresh.
-	a := &Account{expiresAt: time.Now().Add(10 * time.Minute)}
-	if a.needsRefresh() {
-		t.Fatal("10min left should not need refresh")
+func TestNeedsRefreshLead(t *testing.T) {
+	lead := 10 * time.Minute // 2×300s interval
+	// Remaining > lead → not due
+	a := &Account{expiresAt: time.Now().Add(30 * time.Minute)}
+	if a.needsRefresh(lead) {
+		t.Fatal("30min left should not need refresh with 10min lead")
 	}
-	// Within skew → needs refresh
-	b := &Account{expiresAt: time.Now().Add(3 * time.Minute)}
-	if !b.needsRefresh() {
-		t.Fatal("3min left (<5min skew) should need refresh")
+	// Remaining < lead → due
+	b := &Account{expiresAt: time.Now().Add(5 * time.Minute)}
+	if !b.needsRefresh(lead) {
+		t.Fatal("5min left should need refresh with 10min lead")
 	}
 	// Already expired
 	c := &Account{expiresAt: time.Now().Add(-time.Minute)}
-	if !c.needsRefresh() {
+	if !c.needsRefresh(lead) {
 		t.Fatal("expired should need refresh")
 	}
 }

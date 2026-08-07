@@ -35,7 +35,6 @@ const (
 	upstreamURL = "https://cli-chat-proxy.grok.com/v1"
 	cooldownSec = 65
 	defaultTTL  = 6 * time.Hour
-	refreshSkew = 5 * time.Minute
 	maxRetries  = 8 // real upstream tries / account switches; bfs skips do not count
 )
 
@@ -119,10 +118,16 @@ func (a *Account) inCooldown() bool {
 	return time.Now().Before(a.cooldownUntil)
 }
 
-func (a *Account) needsRefresh() bool {
+// needsRefresh: true when remaining TTL <= lead.
+// lead comes from the refresh timer (2×refresh_interval) so a single
+// interval scanner is enough — no separate fixed skew.
+func (a *Account) needsRefresh(lead time.Duration) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return time.Now().After(a.expiresAt.Add(-refreshSkew))
+	if lead <= 0 {
+		lead = 10 * time.Minute
+	}
+	return !time.Now().Before(a.expiresAt.Add(-lead))
 }
 
 func (a *Account) setCooldown(d time.Duration) {
@@ -238,10 +243,18 @@ type Pool struct {
 	cursor  atomic.Uint64 // index of preferred account
 	glob    string
 	client  *http.Client
+	// refreshLead: refresh when remaining TTL <= this. Derived from
+	// refresh_interval (2×interval) so one ticker is the only proactive path.
+	refreshLead time.Duration
 }
 
-func NewPool(glob string, client *http.Client) (*Pool, error) {
-	p := &Pool{glob: glob, client: client}
+// NewPool loads CPA files. refreshLead is how far ahead of exp we refresh;
+// typically 2×refresh_interval so one interval scan cannot miss expiry.
+func NewPool(glob string, client *http.Client, refreshLead time.Duration) (*Pool, error) {
+	if refreshLead <= 0 {
+		refreshLead = 10 * time.Minute
+	}
+	p := &Pool{glob: glob, client: client, refreshLead: refreshLead}
 	if err := p.load(); err != nil {
 		return nil, err
 	}
@@ -347,11 +360,12 @@ func (p *Pool) load() error {
 	p.mu.Unlock()
 	needRef := 0
 	for _, a := range list {
-		if !a.dead && a.needsRefresh() {
+		if !a.dead && a.needsRefresh(p.refreshLead) {
 			needRef++
 		}
 	}
-	log.Printf("[pool] loaded %d accounts (skipped %d .dead, %d bfs-filtered, %d due-refresh)", len(list), skippedDead, bfsN, needRef)
+	log.Printf("[pool] loaded %d accounts (skipped %d .dead, %d bfs-filtered, %d due-refresh lead=%s)",
+		len(list), skippedDead, bfsN, needRef, p.refreshLead)
 	return nil
 }
 
@@ -510,7 +524,7 @@ func (p *Pool) refreshAll(ctx context.Context) {
 	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
 	for _, a := range accounts {
-		if a.isDead() || !a.needsRefresh() {
+		if a.isDead() || !a.needsRefresh(p.refreshLead) {
 			continue
 		}
 		wg.Add(1)
@@ -529,8 +543,13 @@ func (p *Pool) refreshAll(ctx context.Context) {
 			} else {
 				acct.mu.Lock()
 				exp := acct.expiresAt
+				bfs := acct.hasBFS
 				acct.mu.Unlock()
-				log.Printf("[refresh] %s ok (expires %s)", acct.Email, exp.UTC().Format(time.RFC3339))
+				if bfs {
+					log.Printf("[refresh] %s ok (expires %s, bfs)", acct.Email, exp.UTC().Format(time.RFC3339))
+				} else {
+					log.Printf("[refresh] %s ok (expires %s)", acct.Email, exp.UTC().Format(time.RFC3339))
+				}
 			}
 		}(a)
 	}
@@ -542,13 +561,10 @@ func (p *Pool) refresh(ctx context.Context, a *Account) error {
 	a.refreshMu.Lock()
 	defer a.refreshMu.Unlock()
 
-	// Skip only if another goroutine already refreshed past the skew window.
-	// IMPORTANT: must use the same threshold as needsRefresh (refreshSkew).
-	// The old "stillFresh = expiresAt-2min" short-circuit fought needsRefresh
-	// (5min): accounts with 2–5 min left logged "[refresh] ok" but did no HTTP
-	// and no persist — so the same batch re-refreshed on every restart.
+	// Skip if another goroutine already refreshed past the lead window
+	// (same threshold as needsRefresh — one rule only).
 	a.mu.Lock()
-	alreadyFresh := a.AccessToken != "" && time.Now().Before(a.expiresAt.Add(-refreshSkew))
+	alreadyFresh := a.AccessToken != "" && time.Now().Before(a.expiresAt.Add(-p.refreshLead))
 	a.mu.Unlock()
 	if alreadyFresh {
 		return errRefreshSkipped
@@ -600,9 +616,6 @@ func (p *Pool) refresh(ctx context.Context, a *Account) error {
 	}
 
 	a.applyTokens(tr.AccessToken, tr.RefreshToken, tr.ExpiresIn)
-	if a.hasBFSClaim() {
-		log.Printf("[refresh] %s ok (bfs — keep refreshing, skip serve)", a.Email)
-	}
 	if err := a.persist(); err != nil {
 		log.Printf("[persist] %s: %v", a.Email, err)
 	}
@@ -831,7 +844,14 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	client := &http.Client{Timeout: 60 * time.Second, Transport: transport}
-	pool, err := NewPool(cfg.CPADir, client)
+	intervalSec := cfg.RefreshInterval
+	if intervalSec <= 0 {
+		intervalSec = 300
+	}
+	// Single proactive path: ticker every interval. Refresh when remaining TTL
+	// <= 2×interval so one missed beat still leaves a full interval of margin.
+	refreshLead := time.Duration(intervalSec*2) * time.Second
+	pool, err := NewPool(cfg.CPADir, client, refreshLead)
 	if err != nil {
 		return nil, err
 	}
@@ -925,12 +945,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.proxy.ServeHTTP(w, r)
 }
 
+// refreshLoop is the only proactive refresh scheduler.
+// Every refresh_interval seconds it scans the whole pool and refreshes
+// accounts whose remaining TTL <= 2×interval (see Pool.refreshLead).
+// On-demand refresh still exists for 401 / empty AT during requests.
 func (s *Server) refreshLoop(ctx context.Context) {
 	interval := s.cfg.RefreshInterval
 	if interval <= 0 {
 		interval = 300
 	}
-	// kick off immediately — RT first
+	log.Printf("[refresh] interval=%ds lead=%s (refresh when TTL≤lead)",
+		interval, s.pool.refreshLead)
+	// one pass at boot, then only the ticker
 	s.pool.refreshAll(ctx)
 
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
