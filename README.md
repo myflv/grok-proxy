@@ -58,7 +58,7 @@ Grok 多账号反向代理。CPA 轮询 + RT 自动续命 + SSO 复活死号。
 
 | 事件 | 处理 |
 |------|------|
-| AT 将过期 | RT refresh，写回文件（含 bfs 号）；启动时以 JWT `exp` 为准，不因缺 `expired` 字段全量刷 |
+| AT 将过期 | RT refresh，写回文件（含 bfs 号）；启动以 JWT `exp` 为准；`[refresh] ok` 仅真实换票（含新 expires） |
 | AT 含 `bfs` | 不参与上游选号；RT 仍续；刷新后重检 claim |
 | RT 吊销 | 软死 → **先 SSO**；成功则活，失败才 `.dead` |
 | SSO 复活成功 | 写新 token，入池 |
@@ -82,7 +82,7 @@ docker compose up -d
 curl -s localhost:5001/healthz
 ```
 
-镜像：`ghcr.io/myflv/grok-proxy:v0.4.2` / `latest`
+镜像：`ghcr.io/myflv/grok-proxy:v0.4.3` / `latest`
 
 ## 调用
 

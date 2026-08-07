@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -344,7 +345,13 @@ func (p *Pool) load() error {
 	p.mu.Lock()
 	p.accounts = list
 	p.mu.Unlock()
-	log.Printf("[pool] loaded %d accounts (skipped %d .dead, %d bfs-filtered)", len(list), skippedDead, bfsN)
+	needRef := 0
+	for _, a := range list {
+		if !a.dead && a.needsRefresh() {
+			needRef++
+		}
+	}
+	log.Printf("[pool] loaded %d accounts (skipped %d .dead, %d bfs-filtered, %d due-refresh)", len(list), skippedDead, bfsN, needRef)
 	return nil
 }
 
@@ -512,12 +519,18 @@ func (p *Pool) refreshAll(ctx context.Context) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			if err := p.refresh(ctx, acct); err != nil {
+				if errors.Is(err, errRefreshSkipped) {
+					return // concurrent refresh won; stay quiet
+				}
 				log.Printf("[refresh] %s failed: %v", acct.Email, err)
 				if isFatalAuth(err) {
 					acct.markDead(err.Error())
 				}
 			} else {
-				log.Printf("[refresh] %s ok", acct.Email)
+				acct.mu.Lock()
+				exp := acct.expiresAt
+				acct.mu.Unlock()
+				log.Printf("[refresh] %s ok (expires %s)", acct.Email, exp.UTC().Format(time.RFC3339))
 			}
 		}(a)
 	}
@@ -529,12 +542,16 @@ func (p *Pool) refresh(ctx context.Context, a *Account) error {
 	a.refreshMu.Lock()
 	defer a.refreshMu.Unlock()
 
-	// another goroutine may have just refreshed
+	// Skip only if another goroutine already refreshed past the skew window.
+	// IMPORTANT: must use the same threshold as needsRefresh (refreshSkew).
+	// The old "stillFresh = expiresAt-2min" short-circuit fought needsRefresh
+	// (5min): accounts with 2–5 min left logged "[refresh] ok" but did no HTTP
+	// and no persist — so the same batch re-refreshed on every restart.
 	a.mu.Lock()
-	stillFresh := a.AccessToken != "" && time.Now().Before(a.expiresAt.Add(-2*time.Minute))
+	alreadyFresh := a.AccessToken != "" && time.Now().Before(a.expiresAt.Add(-refreshSkew))
 	a.mu.Unlock()
-	if stillFresh {
-		return nil
+	if alreadyFresh {
+		return errRefreshSkipped
 	}
 
 	a.mu.Lock()
@@ -593,6 +610,10 @@ func (p *Pool) refresh(ctx context.Context, a *Account) error {
 }
 
 // ---------- auth error ----------
+
+// errRefreshSkipped: another goroutine already refreshed; not a failure.
+// refreshAll must not log this as "[refresh] ok" (no token exchange happened).
+var errRefreshSkipped = fmt.Errorf("refresh skipped: already fresh")
 
 type authError struct {
 	status int

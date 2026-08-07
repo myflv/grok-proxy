@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"errors"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -179,5 +180,32 @@ func TestLoadFallsBackToExpiredField(t *testing.T) {
 	}
 	if d := a.expiresAt.Sub(exp).Abs(); d > time.Second {
 		t.Fatalf("expiresAt=%s want %s", a.expiresAt, exp)
+	}
+}
+
+func TestNeedsRefreshSkew(t *testing.T) {
+	// Accounts more than refreshSkew from expiry must not need refresh.
+	a := &Account{expiresAt: time.Now().Add(10 * time.Minute)}
+	if a.needsRefresh() {
+		t.Fatal("10min left should not need refresh")
+	}
+	// Within skew → needs refresh
+	b := &Account{expiresAt: time.Now().Add(3 * time.Minute)}
+	if !b.needsRefresh() {
+		t.Fatal("3min left (<5min skew) should need refresh")
+	}
+	// Already expired
+	c := &Account{expiresAt: time.Now().Add(-time.Minute)}
+	if !c.needsRefresh() {
+		t.Fatal("expired should need refresh")
+	}
+}
+
+func TestRefreshSkippedSentinel(t *testing.T) {
+	if errRefreshSkipped == nil {
+		t.Fatal("nil sentinel")
+	}
+	if !errors.Is(errRefreshSkipped, errRefreshSkipped) {
+		t.Fatal("errors.Is self")
 	}
 }
