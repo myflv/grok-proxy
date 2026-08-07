@@ -4,6 +4,7 @@
   "cpa_dir": "/data/cpa/*.json",
   "sso_file": "/data/sso/accounts.txt",
   "refresh_interval": 300,
+  "refresh_lead": 600,
   "revive_enabled": true,
   "revive_interval": 600,
   "revive_concurrency": 2,

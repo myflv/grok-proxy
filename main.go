@@ -46,6 +46,7 @@ type Config struct {
 	CPADir            string `json:"cpa_dir"`            // glob, e.g. /data/cpa/*.json
 	SSOFile           string `json:"sso_file"`           // accounts.txt or dir
 	RefreshInterval   int    `json:"refresh_interval"`   // seconds, default 300
+	RefreshLead       int    `json:"refresh_lead"`       // seconds; refresh when TTL<=lead. 0 → 2×interval
 	ReviveEnabled     *bool  `json:"revive_enabled"`     // default true if sso_file set
 	ReviveInterval    int    `json:"revive_interval"`    // seconds, default 600
 	ReviveConcurrency int    `json:"revive_concurrency"` // default 2
@@ -848,9 +849,14 @@ func NewServer(cfg Config) (*Server, error) {
 	if intervalSec <= 0 {
 		intervalSec = 300
 	}
-	// Single proactive path: ticker every interval. Refresh when remaining TTL
-	// <= 2×interval so one missed beat still leaves a full interval of margin.
-	refreshLead := time.Duration(intervalSec*2) * time.Second
+	// Single proactive path: ticker every interval.
+	// refresh_lead (seconds) = how far ahead of exp we refresh.
+	// 0 / omit → 2×refresh_interval (one missed tick still has margin).
+	leadSec := cfg.RefreshLead
+	if leadSec <= 0 {
+		leadSec = intervalSec * 2
+	}
+	refreshLead := time.Duration(leadSec) * time.Second
 	pool, err := NewPool(cfg.CPADir, client, refreshLead)
 	if err != nil {
 		return nil, err

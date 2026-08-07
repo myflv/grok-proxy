@@ -13,6 +13,7 @@ Grok 多账号反向代理。CPA 轮询 + RT 自动续命 + SSO 复活死号。
   "cpa_dir": "/data/cpa/*.json",
   "sso_file": "/data/sso/accounts.txt",
   "refresh_interval": 300,
+  "refresh_lead": 600,
   "revive_enabled": true,
   "revive_interval": 600,
   "revive_concurrency": 2,
@@ -26,7 +27,8 @@ Grok 多账号反向代理。CPA 轮询 + RT 自动续命 + SSO 复活死号。
 | `api_key` | 客户端固定 key（空则不校验） |
 | `cpa_dir` | CPA 通配路径，如 `/data/cpa/*.json`（**不加载** `*.json.dead`） |
 | `sso_file` | 注册机 `SSO/accounts.txt`（`email:pass:sso`），或目录 |
-| `refresh_interval` | 唯一主动刷新周期（秒），默认 300。到期前 **2×interval** 内会刷（300s → 提前 10 分钟） |
+| `refresh_interval` | 主动刷新扫描周期（秒），默认 300 |
+| `refresh_lead` | 剩余 TTL ≤ 该秒数则换票。默认 **0 = 2×refresh_interval**（300→600s）。可自行改小/改大 |
 | `revive_enabled` | 是否用 SSO 复活死 RT（有 `sso_file` 时默认开） |
 | `revive_interval` | 限流重试扫描间隔（秒），默认 600 |
 | `revive_concurrency` | 同时 SSO OAuth 数，默认 2（防 429；2000 号务必小） |
@@ -49,7 +51,7 @@ Grok 多账号反向代理。CPA 轮询 + RT 自动续命 + SSO 复活死号。
 启动
   → 只加载 *.json（跳过 *.json.dead 坟场）
   → 解析 AT JWT：带 `bfs` 的号标记为 serve-skip（仍入池）
-  → 定时 refresh（每 refresh_interval）：全池判断，TTL≤2×interval 才换票写回
+  → 定时 refresh（每 refresh_interval）：全池判断，TTL≤refresh_lead 才换票写回
   → RT invalid_grant → 软死 + 排队 SSO（文件仍是 *.json）
   → SSO 成功 → 写新 token，复活
   → SSO 永久失败 / 无 SSO → 改名 *.json.dead（下次启动永不再碰）
@@ -58,7 +60,7 @@ Grok 多账号反向代理。CPA 轮询 + RT 自动续命 + SSO 复活死号。
 
 | 事件 | 处理 |
 |------|------|
-| AT 将过期 | 仅定时扫描：TTL≤2×`refresh_interval` 时 RT 换票写回；启动以 JWT `exp` 为准；401/空 AT 仍可应急刷 |
+| AT 将过期 | 仅定时扫描：TTL≤`refresh_lead`（默认 2×interval）时 RT 换票写回；启动以 JWT `exp` 为准；401/空 AT 仍可应急刷 |
 | AT 含 `bfs` | 不参与上游选号；RT 仍续；刷新后重检 claim |
 | RT 吊销 | 软死 → **先 SSO**；成功则活，失败才 `.dead` |
 | SSO 复活成功 | 写新 token，入池 |
@@ -82,7 +84,7 @@ docker compose up -d
 curl -s localhost:5001/healthz
 ```
 
-镜像：`ghcr.io/myflv/grok-proxy:v0.4.4` / `latest`
+镜像：`ghcr.io/myflv/grok-proxy:v0.4.5` / `latest`
 
 ## 调用
 
