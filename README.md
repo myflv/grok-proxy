@@ -84,7 +84,7 @@ docker compose up -d
 curl -s localhost:5001/healthz
 ```
 
-镜像：`ghcr.io/myflv/grok-proxy:v0.4.5` / `latest`
+镜像：`ghcr.io/myflv/grok-proxy:v0.4.7` / `latest`
 
 ## 调用
 

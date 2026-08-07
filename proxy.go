@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -43,7 +42,7 @@ func buildTransport(proxyStr string) (*http.Transport, error) {
 	default:
 		return nil, fmt.Errorf("unsupported proxy scheme %q (use http, https, socks5, or socks5h)", u.Scheme)
 	}
-	log.Printf("[proxy] outbound via %s", proxyStr)
+	// Caller logs once at boot — buildTransport is used for both upstream and SSO OAuth.
 	return tr, nil
 }
 

@@ -344,7 +344,7 @@ func (p *Pool) load() error {
 	p.mu.Lock()
 	p.accounts = list
 	p.mu.Unlock()
-	log.Printf("[pool] loaded %d accounts (skipped %d .dead, %d bfs-filtered, %d due-refresh lead=%s)",
+	log.Printf("[pool] loaded %d accounts (dead-skip=%d bfs=%d due-refresh=%d lead=%s)",
 		len(list), skippedDead, bfsN, needRef, p.refreshLead)
 	return nil
 }
@@ -813,6 +813,9 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.Proxy != "" {
+		log.Printf("[proxy] outbound via %s", cfg.Proxy)
+	}
 	client := &http.Client{Timeout: 60 * time.Second, Transport: transport}
 	intervalSec := cfg.RefreshInterval
 	if intervalSec <= 0 {
@@ -859,7 +862,6 @@ func NewServer(cfg Config) (*Server, error) {
 		s.sso = sso
 		s.reviver = NewReviver(pool, sso, oa, cpaDirFromGlob(cfg.CPADir), workers)
 		globalReviver = s.reviver
-		log.Printf("[revive] enabled sso=%d workers=%d", sso.Len(), workers)
 	}
 
 	s.proxy = &httputil.ReverseProxy{
@@ -929,8 +931,6 @@ func (s *Server) refreshLoop(ctx context.Context) {
 	if interval <= 0 {
 		interval = 300
 	}
-	log.Printf("[refresh] interval=%ds lead=%s (refresh when TTL≤lead)",
-		interval, s.pool.refreshLead)
 	// one pass at boot, then only the ticker
 	s.pool.refreshAll(ctx)
 
@@ -990,6 +990,30 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Boot summary before background loops so logs stay ordered.
+	auth := "off"
+	if cfg.APIKey != "" {
+		auth = "on"
+	}
+	log.Printf("[listen] %s live=%d total=%d bfs=%d auth=%s",
+		cfg.Listen, srv.pool.liveCount(), srv.pool.totalCount(), srv.pool.bfsCount(), auth)
+	ri := cfg.RefreshInterval
+	if ri <= 0 {
+		ri = 300
+	}
+	log.Printf("[refresh] interval=%ds lead=%s", ri, srv.pool.refreshLead)
+	if srv.reviver != nil {
+		vi := cfg.ReviveInterval
+		if vi <= 0 {
+			vi = 600
+		}
+		vc := cfg.ReviveConcurrency
+		if vc <= 0 {
+			vc = 2
+		}
+		log.Printf("[revive] interval=%ds workers=%d sso=%d", vi, vc, srv.sso.Len())
+	}
+
 	go srv.refreshLoop(ctx)
 	go srv.reviveLoop(ctx)
 
@@ -1006,30 +1030,10 @@ func main() {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("grok-proxy listening on %s (live=%d total=%d)",
-		cfg.Listen, srv.pool.liveCount(), srv.pool.totalCount())
-	if cfg.APIKey != "" {
-		log.Printf("auth: enabled")
-	} else {
-		log.Printf("auth: disabled")
-	}
-	if srv.reviver != nil {
-		ri := cfg.ReviveInterval
-		if ri <= 0 {
-			ri = 600
-		}
-		rc := cfg.ReviveConcurrency
-		if rc <= 0 {
-			rc = 2
-		}
-		log.Printf("revive: sso-backed (interval=%ds concurrency=%d sso=%d)",
-			ri, rc, srv.sso.Len())
-	}
-
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
-	log.Printf("shutdown")
+	log.Printf("[shutdown]")
 }
 
 // ---------- helpers ----------
