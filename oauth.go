@@ -420,10 +420,11 @@ func tokensFrom(doc map[string]any, ep string) (oauthTokens, error) {
 	}, nil
 }
 
-func jwtClaim(token, key string) string {
+// jwtPayload decodes the middle segment of a JWT without verifying the signature.
+func jwtPayload(token string) map[string]any {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return ""
+		return nil
 	}
 	payload := parts[1]
 	switch len(payload) % 4 {
@@ -436,17 +437,36 @@ func jwtClaim(token, key string) string {
 	if err != nil {
 		raw, err = base64.RawURLEncoding.DecodeString(parts[1])
 		if err != nil {
-			return ""
+			return nil
 		}
 	}
 	var m map[string]any
 	if json.Unmarshal(raw, &m) != nil {
+		return nil
+	}
+	return m
+}
+
+func jwtClaim(token, key string) string {
+	m := jwtPayload(token)
+	if m == nil {
 		return ""
 	}
 	if v, ok := m[key].(string); ok {
 		return v
 	}
 	return ""
+}
+
+// jwtHasClaim reports whether key exists in the JWT payload (any JSON type).
+// Used to detect xAI access_token "bfs" claim without caring about its value.
+func jwtHasClaim(token, key string) bool {
+	m := jwtPayload(token)
+	if m == nil {
+		return false
+	}
+	_, ok := m[key]
+	return ok
 }
 
 func locationError(loc string) error {

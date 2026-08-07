@@ -1,6 +1,6 @@
 services:
   grok-proxy:
-    image: ghcr.io/myflv/grok-proxy:v0.4.0
+    image: ghcr.io/myflv/grok-proxy:v0.4.1
     container_name: grok-proxy
     restart: unless-stopped
     ports:

@@ -42,12 +42,14 @@ Grok 多账号反向代理。CPA 轮询 + RT 自动续命 + SSO 复活死号。
 | 429 | 该号冷却 65s，cursor 前进，换下一号 |
 | 402 额度 | 该号冷却 1h，换下一号 |
 | 401/403 + RT 刷失败 | 软死/冷却，换下一号 |
-| 单请求内 | 最多换号重试 8 次 |
+| access_token 带 `bfs` claim | **不选号出站**；仍加载 + RT 续期；刷新后若 `bfs` 消失则恢复可用 |
+| 单请求内 | 最多 **8 次真实上游尝试/换号**（429/402/401）；`bfs` 跳过不计入 |
 
 ```
 启动
   → 只加载 *.json（跳过 *.json.dead 坟场）
-  → refreshAll：RT 续命并写回
+  → 解析 AT JWT：带 `bfs` 的号标记为 serve-skip（仍入池）
+  → refreshAll：RT 续命并写回（含 bfs 号）
   → RT invalid_grant → 软死 + 排队 SSO（文件仍是 *.json）
   → SSO 成功 → 写新 token，复活
   → SSO 永久失败 / 无 SSO → 改名 *.json.dead（下次启动永不再碰）
@@ -56,7 +58,8 @@ Grok 多账号反向代理。CPA 轮询 + RT 自动续命 + SSO 复活死号。
 
 | 事件 | 处理 |
 |------|------|
-| AT 将过期 | RT refresh，写回文件 |
+| AT 将过期 | RT refresh，写回文件（含 bfs 号） |
+| AT 含 `bfs` | 不参与上游选号；RT 仍续；刷新后重检 claim |
 | RT 吊销 | 软死 → **先 SSO**；成功则活，失败才 `.dead` |
 | SSO 复活成功 | 写新 token，入池 |
 | SSO 永久失败 | `*.json.dead`，下次启动跳过（不反复打 SSO） |
@@ -79,7 +82,7 @@ docker compose up -d
 curl -s localhost:5001/healthz
 ```
 
-镜像：`ghcr.io/myflv/grok-proxy:v0.4.0` / `latest`
+镜像：`ghcr.io/myflv/grok-proxy:v0.4.1` / `latest`
 
 ## 调用
 
@@ -95,7 +98,7 @@ from openai import OpenAI
 client = OpenAI(api_key="sk-local-fixed", base_url="http://127.0.0.1:5001")
 ```
 
-健康检查：`GET /healthz` → `live` / `total` / `sso` / `revive_queue`
+健康检查：`GET /healthz` → `live` / `total` / `bfs` / `sso` / `revive_queue`
 
 ## 源码运行
 

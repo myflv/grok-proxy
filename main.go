@@ -2,6 +2,8 @@
 //
 // Loads CPA JSON, sticky account selection, RT auto-refresh (persist to disk),
 // 429/402 cooldown + switch, SSO revive on dead RT, permanent *.json.dead after SSO fail.
+// Access tokens with JWT claim "bfs" stay in the pool and keep RT refresh, but are
+// never selected for upstream requests (re-evaluated after each refresh).
 // Clients always see one endpoint and one api_key.
 package main
 
@@ -33,7 +35,7 @@ const (
 	cooldownSec = 65
 	defaultTTL  = 6 * time.Hour
 	refreshSkew = 5 * time.Minute
-	maxRetries  = 8 // switch across accounts on 429/402/401
+	maxRetries  = 8 // real upstream tries / account switches; bfs skips do not count
 )
 
 // ---------- config ----------
@@ -76,6 +78,9 @@ type Account struct {
 	expiresAt     time.Time
 	cooldownUntil time.Time
 	dead          bool
+	// hasBFS: access_token JWT carries "bfs" claim. Still loaded + RT-refreshed,
+	// but skipped when selecting an account for upstream requests.
+	hasBFS bool
 }
 
 func (a *Account) snapshot() (token, email string, headers map[string]string, dead bool) {
@@ -92,6 +97,19 @@ func (a *Account) isDead() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.dead
+}
+
+func (a *Account) hasBFSClaim() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.hasBFS
+}
+
+// usableForRequest: not dead, not bfs-filtered (cooldown checked separately).
+func (a *Account) usableForRequest() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return !a.dead && !a.hasBFS
 }
 
 func (a *Account) inCooldown() bool {
@@ -195,6 +213,7 @@ func (a *Account) applyTokens(access, refresh string, expiresIn int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.AccessToken = access
+	a.hasBFS = jwtHasClaim(access, "bfs")
 	if refresh != "" {
 		a.RefreshToken = refresh
 	}
@@ -275,6 +294,7 @@ func (p *Pool) load() error {
 
 		acct.filePath = path
 		acct.dead = false
+		acct.hasBFS = jwtHasClaim(acct.AccessToken, "bfs")
 		if acct.Expired != "" {
 			if t, err := time.Parse(time.RFC3339, acct.Expired); err == nil {
 				acct.expiresAt = t
@@ -289,24 +309,35 @@ func (p *Pool) load() error {
 		}
 
 		list = append(list, &acct)
-		log.Printf("[load] %s (expires %s)", acct.Email, acct.expiresAt.Format(time.RFC3339))
+		if acct.hasBFS {
+			log.Printf("[load] %s (expires %s) bfs=yes — refresh only, skip serve",
+				acct.Email, acct.expiresAt.Format(time.RFC3339))
+		} else {
+			log.Printf("[load] %s (expires %s)", acct.Email, acct.expiresAt.Format(time.RFC3339))
+		}
 	}
 
 	if len(list) == 0 {
 		return fmt.Errorf("no valid CPA JSON in %s", p.glob)
 	}
 
+	bfsN := 0
+	for _, a := range list {
+		if a.hasBFS {
+			bfsN++
+		}
+	}
 	p.mu.Lock()
 	p.accounts = list
 	p.mu.Unlock()
-	log.Printf("[pool] loaded %d accounts (skipped %d .dead)", len(list), skippedDead)
+	log.Printf("[pool] loaded %d accounts (skipped %d .dead, %d bfs-filtered)", len(list), skippedDead, bfsN)
 	return nil
 }
 
 func countLive(list []*Account) int {
 	n := 0
 	for _, a := range list {
-		if !a.dead {
+		if !a.dead && !a.hasBFS {
 			n++
 		}
 	}
@@ -340,7 +371,8 @@ func (p *Pool) liveCount() int {
 	defer p.mu.RUnlock()
 	n := 0
 	for _, a := range p.accounts {
-		if !a.isDead() {
+		// bfs accounts stay in pool for RT refresh but are not "live" for serving
+		if a.usableForRequest() {
 			n++
 		}
 	}
@@ -353,10 +385,24 @@ func (p *Pool) totalCount() int {
 	return len(p.accounts)
 }
 
+func (p *Pool) bfsCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	n := 0
+	for _, a := range p.accounts {
+		if a.hasBFSClaim() {
+			n++
+		}
+	}
+	return n
+}
+
 // selectAccount picks a live account.
-// Sticky mode: reuse the current cursor account until it is dead or cooling,
+// Sticky mode: reuse the current cursor account until it is dead, bfs-filtered, or cooling,
 // then advance to the next available one. Not per-request round-robin.
 // exclude: skip this email (used when retrying after 429/402/auth fail).
+// Accounts whose access_token carries "bfs" are never selected for upstream use
+// (they remain in the pool and still get RT refresh).
 func (p *Pool) selectAccount(exclude string) *Account {
 	p.mu.RLock()
 	n := len(p.accounts)
@@ -367,11 +413,11 @@ func (p *Pool) selectAccount(exclude string) *Account {
 		return nil
 	}
 
-	// 1) Prefer sticky cursor (if not excluded / dead / cooling)
+	// 1) Prefer sticky cursor (if not excluded / dead / bfs / cooling)
 	cur := int(p.cursor.Load() % uint64(n))
 	if exclude == "" {
 		a := snapshot[cur]
-		if !a.isDead() && !a.inCooldown() {
+		if a.usableForRequest() && !a.inCooldown() {
 			return a
 		}
 	}
@@ -380,18 +426,18 @@ func (p *Pool) selectAccount(exclude string) *Account {
 	for i := 0; i < n; i++ {
 		idx := (cur + 1 + i) % n
 		a := snapshot[idx]
-		if a.isDead() || a.Email == exclude || a.inCooldown() {
+		if !a.usableForRequest() || a.Email == exclude || a.inCooldown() {
 			continue
 		}
 		p.cursor.Store(uint64(idx))
 		return a
 	}
 
-	// 3) Fallback: live even if cooling (except excluded)
+	// 3) Fallback: usable even if cooling (except excluded / bfs / dead)
 	for i := 0; i < n; i++ {
 		idx := (cur + i) % n
 		a := snapshot[idx]
-		if a.isDead() || a.Email == exclude {
+		if !a.usableForRequest() || a.Email == exclude {
 			continue
 		}
 		p.cursor.Store(uint64(idx))
@@ -523,6 +569,9 @@ func (p *Pool) refresh(ctx context.Context, a *Account) error {
 	}
 
 	a.applyTokens(tr.AccessToken, tr.RefreshToken, tr.ExpiresIn)
+	if a.hasBFSClaim() {
+		log.Printf("[refresh] %s ok (bfs — keep refreshing, skip serve)", a.Email)
+	}
 	if err := a.persist(); err != nil {
 		log.Printf("[persist] %s: %v", a.Email, err)
 	}
@@ -578,40 +627,69 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	acct, _ := req.Context().Value(accountKey{}).(*Account)
 
+	// maxRetries = real upstream tries / account switches (429/402/401).
+	// bfs/dead reselects do not consume a slot — selectAccount never returns them.
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		if acct == nil || acct.isDead() {
-			acct = t.pool.selectAccount("")
-		}
-		if acct == nil {
-			return jsonResponse(http.StatusServiceUnavailable, map[string]any{
-				"error": "no account available",
-			}), nil
-		}
+		var token, email string
+		var headers map[string]string
 
-		token, email, headers, dead := acct.snapshot()
-		if dead {
-			acct = t.pool.selectAccount(email)
-			continue
-		}
-		// access empty but may still have RT — try refresh once
-		if token == "" {
-			ctx, cancel := context.WithTimeout(req.Context(), 20*time.Second)
-			refErr := t.pool.refresh(ctx, acct)
-			cancel()
-			if refErr != nil {
-				if isFatalAuth(refErr) {
-					acct.markDead(refErr.Error())
+		// Pick a servable account. Inner loop is free w.r.t. maxRetries — only for
+		// rare races (bfs flips mid-flight). Hard-capped so it cannot spin.
+		gotToken := false
+		for reselect := 0; reselect < 16; reselect++ {
+			if acct == nil || !acct.usableForRequest() {
+				exclude := ""
+				if acct != nil {
+					exclude = acct.Email
 				}
-				t.pool.advanceFrom(email)
-				acct = t.pool.selectAccount(email)
-				continue
+				acct = t.pool.selectAccount(exclude)
 			}
+			if acct == nil {
+				return jsonResponse(http.StatusServiceUnavailable, map[string]any{
+					"error": "no account available",
+				}), nil
+			}
+
+			var dead bool
 			token, email, headers, dead = acct.snapshot()
-			if dead || token == "" {
-				t.pool.advanceFrom(email)
-				acct = t.pool.selectAccount(email)
+			if dead || acct.hasBFSClaim() {
+				// race / post-refresh flip — drop without burning attempt
+				acct = nil
 				continue
 			}
+			// access empty but may still have RT — try refresh once
+			if token == "" {
+				ctx, cancel := context.WithTimeout(req.Context(), 20*time.Second)
+				refErr := t.pool.refresh(ctx, acct)
+				cancel()
+				if refErr != nil {
+					if isFatalAuth(refErr) {
+						acct.markDead(refErr.Error())
+					}
+					t.pool.advanceFrom(email)
+					acct = t.pool.selectAccount(email)
+					// burn this attempt: we engaged the account and moved on
+					break
+				}
+				token, email, headers, dead = acct.snapshot()
+				if dead || acct.hasBFSClaim() {
+					// refreshed into bfs — skip free, do not burn attempt
+					t.pool.advanceFrom(email)
+					acct = nil
+					continue
+				}
+				if token == "" {
+					t.pool.advanceFrom(email)
+					acct = t.pool.selectAccount(email)
+					break // empty after refresh → burn attempt, switch
+				}
+			}
+			gotToken = true
+			break
+		}
+		if !gotToken {
+			// failed empty-token refresh path, or reselect cap — next attempt
+			continue
 		}
 
 		// rebuild request for this attempt
@@ -776,6 +854,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"ok":    true,
 			"live":  s.pool.liveCount(),
 			"total": s.pool.totalCount(),
+			"bfs":   s.pool.bfsCount(),
 		}
 		if s.sso != nil {
 			h["sso"] = s.sso.Len()
