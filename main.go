@@ -31,7 +31,7 @@ import (
 const (
 	tokenURL    = "https://auth.x.ai/oauth2/token"
 	clientID    = "b1a00492-073a-47ea-816f-4c329264a828"
-	oauthScope  = "openid profile email offline_access grok-cli:access api:access"
+	oauthScope  = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write"
 	upstreamURL = "https://cli-chat-proxy.grok.com/v1"
 	cooldownSec = 65
 	defaultTTL  = 6 * time.Hour
@@ -230,9 +230,9 @@ type Pool struct {
 	mu       sync.RWMutex
 	accounts []*Account
 	// sticky: keep using the same account until it cools down / dies
-	cursor  atomic.Uint64 // index of preferred account
-	glob    string
-	client  *http.Client
+	cursor atomic.Uint64 // index of preferred account
+	glob   string
+	client *http.Client
 	// refreshLead: refresh when remaining TTL <= this. Derived from
 	// refresh_interval (2×interval) so one ticker is the only proactive path.
 	refreshLead time.Duration
@@ -552,7 +552,6 @@ func (p *Pool) refresh(ctx context.Context, a *Account) error {
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {rt},
 		"client_id":     {clientID},
-		"scope":         {oauthScope},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {

@@ -133,12 +133,12 @@ func (s *SSOStore) MarkBad(email string) {
 
 func defaultCPAHeaders() map[string]string {
 	return map[string]string{
-		"User-Agent":               "grok-shell/0.2.93 (linux; x86_64)",
+		"User-Agent":               "grok-shell/1.0.13 (linux; x86_64)",
 		"X-XAI-Token-Auth":         "xai-grok-cli",
 		"x-authenticateresponse":   "authenticate-response",
 		"x-compaction-at":          "400000",
 		"x-grok-client-identifier": "grok-shell",
-		"x-grok-client-version":    "0.2.93",
+		"x-grok-client-version":    "1.0.13",
 		"x-xai-token-auth":         "xai-grok-cli",
 	}
 }
